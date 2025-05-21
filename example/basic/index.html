@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>WebSocket Client with Query Params</title>
+    <style>
+        body { font-family: sans-serif; padding: 1rem; }
+        input, button { margin: 0.5rem 0; display: block; }
+        #response p { margin: 0.25rem 0; }
+        .event-type { font-weight: bold; }
+    </style>
+</head>
+<body>
+<h2>WebSocket Client</h2>
+
+<label for="name">Name:</label>
+<input type="text" id="name" placeholder="Enter your name">
+
+<label for="session">Session ID:</label>
+<input type="text" id="session" placeholder="Enter session ID">
+
+<button id="connectBtn">Connect</button>
+
+<div id="chat" style="display:none">
+    <input type="text" id="message" placeholder="Type a message">
+    <button id="sendBtn">Send</button>
+    <button id="disconnectBtn">Disconnect</button>
+    <div id="response"></div>
+</div>
+
+<script>
+    // Mirror your Go types:
+    const EventType = {
+        UserJoined:      "UserJoined",
+        UserLeft:        "UserLeft",
+        UserDataChanged: "UserDataChanged",
+        General:         "General"
+    };
+
+    let socket;
+    let userName, sessionId;
+
+    document.getElementById('connectBtn').onclick = connectWebSocket;
+    document.getElementById('sendBtn').onclick    = sendMessage;
+    document.getElementById('disconnectBtn').onclick = disconnectWebSocket;
+
+    function connectWebSocket() {
+        userName  = document.getElementById("name").value.trim();
+        sessionId = document.getElementById("session").value.trim();
+
+        if (!userName || !sessionId) {
+            alert("Please enter both name and session ID.");
+            return;
+        }
+
+        const wsUrl = `ws://localhost:8080/ws?name=${encodeURIComponent(userName)}&session=${encodeURIComponent(sessionId)}`;
+        socket = new WebSocket(wsUrl);
+
+        socket.onopen = () => {
+            showChatUI(true);
+            appendResponse(`Connected as <em>${userName}</em> in session <em>${sessionId}</em>.`);
+            // announce join
+            socket.send(JSON.stringify({
+                SenderID:   userName,
+                ReceiverID: "",
+                Type:       EventType.UserJoined,
+                Message:    `${userName} joined`,
+                Remote:     false,
+                Raw:        null
+            }));
+        };
+
+        socket.onmessage = event => {
+            try {
+                const ev = JSON.parse(event.data);
+                appendResponse(
+                    `<span class="event-type">[${ev.Type}]</span><p>${JSON.stringify(ev.Raw)}</p> ` +
+                    (ev.SenderID ? `<strong>${ev.SenderID}:</strong> ` : "") +
+                    `${ev.Message || ""}`
+                );
+            } catch (err) {
+                console.warn("Non-JSON message received, ignoring.", err);
+            }
+        };
+
+        socket.onerror = err => {
+            appendResponse("WebSocket error: " + err.message);
+        };
+
+        socket.onclose = () => {
+            appendResponse("Disconnected from server.");
+            showChatUI(false);
+        };
+    }
+
+    function sendMessage() {
+        const text = document.getElementById("message").value.trim();
+        if (!text) return;
+        if (socket && socket.readyState === WebSocket.OPEN) {
+            const payload = {
+                SenderID:   userName,
+                ReceiverID: "",
+                Type:       EventType.General,
+                Message:    text,
+                Remote:     false,
+                Raw:        null
+            };
+            socket.send(JSON.stringify(payload));
+            document.getElementById("message").value = "";
+        } else {
+            alert("Connection is not open.");
+        }
+    }
+
+    function disconnectWebSocket() {
+        if (socket && socket.readyState === WebSocket.OPEN) {
+            // announce leave
+            socket.send(JSON.stringify({
+                SenderID:   userName,
+                ReceiverID: "",
+                Type:       EventType.UserLeft,
+                Message:    `${userName} left`,
+                Remote:     false,
+                Raw:        null
+            }));
+            socket.close();
+        }
+    }
+
+    function appendResponse(html) {
+        const container = document.getElementById("response");
+        container.innerHTML += `<p>${html}</p>`;
+        container.scrollTop = container.scrollHeight;
+    }
+
+    function showChatUI(connected) {
+        document.getElementById("chat").style.display = connected ? "block" : "none";
+        document.getElementById("connectBtn").disabled = connected;
+        document.getElementById("name").disabled       = connected;
+        document.getElementById("session").disabled    = connected;
+    }
+</script>
+</body>
+</html>

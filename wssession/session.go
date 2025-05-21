@@ -6,20 +6,20 @@ import (
 	"net/http"
 )
 
-type WsHandler func(w http.ResponseWriter, r *http.Request, receiveEvent chan wsmodels.Event, sendEvent chan wsmodels.Event)
+type WsHandler func(w http.ResponseWriter, r *http.Request, receiveEvent wsmodels.Event)
 
 type Session interface {
 	ID() string
 	Status() string
-	Init(ctx context.Context) error
+	Init(ctx context.Context, sessionID string, user *wsmodels.User) error
 
-	User() string
-	ListUsers()
+	User() *wsmodels.User
+	ListUsers() []*wsmodels.User
 	Disconnect()
 
-	GetHistory()
-	SendEvent()
-	GetEvent()
+	GetHistory() []*wsmodels.Event
+	SendEvent(ctx context.Context, e wsmodels.Event)
+	GetEvent() chan<- wsmodels.Event
 
 	WsHandler(h WsHandler) http.HandlerFunc
 }

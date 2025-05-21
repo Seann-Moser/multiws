@@ -5,17 +5,16 @@ type User struct {
 	Name       string
 	ProfileUrl string
 
-	Status   Status
+	Status   string
 	Meta     map[string]interface{}
 	Joined   int64
 	LastSeen int64
+	Host     bool
 }
 
-type Status string
-
 const (
-	StatusConnected    Status = "connected"
-	StatusDisconnected Status = "disconnected"
-	StatusError        Status = "error"
-	StatusIdle         Status = "idle"
+	StatusConnected    string = "connected"
+	StatusDisconnected string = "disconnected"
+	StatusError        string = "error"
+	StatusIdle         string = "idle"
 )

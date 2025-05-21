@@ -2,18 +2,39 @@ package wsqueue
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"github.com/Seann-Moser/multiws/wsmodels"
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"log/slog"
+	"strings"
 )
 
-type RedisQueue[T any] struct {
-	client      *redis.Client
-	channelName string
+type RedisStreamQueue[T any] struct {
+	client *redis.Client
+	// how many events to buffer in the Go channel
 	channelSize int
+	group       string
+	consumer    string
 }
 
-func NewRedisQueue[T any](addr, password string, db int, channelName string, channelSize int) Queue[T] {
+func (q *RedisStreamQueue[T]) ConsumeEvent(ctx context.Context, topic string) wsmodels.Event {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (q *RedisStreamQueue[T]) ProduceEvent(ctx context.Context, topic string, e wsmodels.Event) {
+	//TODO implement me
+	panic("implement me")
+}
+
+// NewRedisStreamQueue returns a queue that speaks Redis Streams.
+// addr/password/db are passed straight to redis.Options
+func NewRedisQueue[T any](
+	addr, password string,
+	db, channelSize int, groupBox, consumer string,
+) (Queue[T], error) {
 	if channelSize < 0 {
 		channelSize = 0
 	}
@@ -22,73 +43,124 @@ func NewRedisQueue[T any](addr, password string, db int, channelName string, cha
 		Password: password,
 		DB:       db,
 	})
-	return &RedisQueue[T]{
+	if err := client.Ping(context.Background()).Err(); err != nil {
+		slog.Error("NewRedisStreamQueue: redis", "err", err)
+		return nil, fmt.Errorf("NewRedisStreamQueue: redis:%w", err)
+	}
+	if groupBox == "" {
+		return nil, fmt.Errorf("NewRedisStreamQueue: groupBox not specified")
+	}
+	if consumer == "" {
+		consumer = uuid.New().String()
+		slog.Info("consumer not specified, using random consumer", "consumer", consumer)
+	}
+	return &RedisStreamQueue[T]{
 		client:      client,
-		channelName: channelName,
 		channelSize: channelSize,
-	}
+		group:       groupBox,
+		consumer:    consumer,
+	}, nil
 }
 
-func (q *RedisQueue[T]) Subscribe(ctx context.Context, topic string) <-chan wsmodels.Event {
-	ch := make(chan wsmodels.Event, q.channelSize)
-	pubsub := q.client.Subscribe(ctx, topic)
-	go func() {
-		for msg := range pubsub.Channel() {
-			var event wsmodels.Event
-			if err := event.UnmarshalBinary([]byte(msg.Payload)); err != nil {
-				slog.Error("failed to unmarshal event", "error", err)
-				continue
-			}
-			ch <- event
-		}
-		close(ch)
-	}()
-	return ch
-}
-
-func (q *RedisQueue[T]) Produce(ctx context.Context, topic string) chan<- wsmodels.Event {
+// Produce pushes events into the given stream (topic).  Returns
+// a Go channel you can send into.
+func (q *RedisStreamQueue[T]) Produce(
+	ctx context.Context,
+	topic string,
+) chan<- wsmodels.Event {
 	ch := make(chan wsmodels.Event, q.channelSize)
 	go func() {
-		for event := range ch {
-			data, err := event.MarshalBinary()
+		defer close(ch)
+		defer fmt.Println("finished produce")
+		for evt := range ch {
+			data, err := json.Marshal(evt)
 			if err != nil {
-				slog.Error("failed to marshal event", "error", err)
+				slog.Error("Produce: marshal", "err", err)
 				continue
 			}
-			if err := q.client.Publish(ctx, topic, data).Err(); err != nil {
-				slog.Error("failed to publish event", "error", err)
+			// XAdd will append to the stream named by topic
+			if _, err := q.client.XAdd(ctx, &redis.XAddArgs{
+				Stream: topic,
+				Values: map[string]interface{}{"data": data},
+			}).Result(); err != nil {
+				slog.Error("Produce: XAdd", "err", err)
 			}
 		}
 	}()
 	return ch
 }
 
-func (q *RedisQueue[T]) ConsumeEvent(ctx context.Context, topic string) wsmodels.Event {
-	res, err := q.client.BLPop(ctx, 0, topic).Result()
-	if err != nil {
-		slog.Error("failed to consume event", "error", err)
-		return wsmodels.Event{}
+// Subscribe creates (if needed) and then joins a consumer-group on the given
+// stream (topic).  Each group sees every message; within a group multiple
+// consumers can share load, but each group gets all messages.
+//
+//   - group:   a logical fan-out channel (e.g. "notifications")
+//   - consumer: a unique name for *this* consumer (e.g. pod-id, host name)
+//
+// It returns a Go channel of events; you must ack each message yourself
+// by returning nil (ACK) or requeueing by returning an error.
+func (q *RedisStreamQueue[T]) Subscribe(
+	ctx context.Context,
+	topic string,
+) <-chan wsmodels.Event {
+	// ensure the group exists (start reading new messages)
+	if err := q.client.XGroupCreateMkStream(ctx, topic, q.group, "$").Err(); err != nil {
+		// ignore BUSYGROUP if already created
+		if !strings.Contains(err.Error(), "BUSYGROUP") {
+			slog.Error("Subscribe: XGroupCreateMkStream", "err", err)
+			return nil
+		}
 	}
-	var event wsmodels.Event
-	if err := event.UnmarshalBinary([]byte(res[1])); err != nil {
-		slog.Error("failed to unmarshal event", "error", err)
-	}
-	return event
+	defer q.client.XGroupDelConsumer(context.Background(), topic, q.group, q.consumer)
+
+	out := make(chan wsmodels.Event, q.channelSize)
+	go func() {
+		defer fmt.Println("finished subscribe")
+		defer close(out)
+		for {
+			// read one message at a time, block indefinitely
+			streams, err := q.client.XReadGroup(ctx, &redis.XReadGroupArgs{
+				Group:    q.group,
+				Consumer: q.consumer,
+				Streams:  []string{topic, ">"},
+				Count:    1,
+				Block:    0,
+			}).Result()
+			if err != nil {
+				slog.Error("Subscribe: XReadGroup", "err", err)
+				return
+			}
+			for _, msg := range streams[0].Messages {
+				raw, ok := msg.Values["data"].(string)
+				if !ok {
+					slog.Error("Subscribe: bad payload type", "values", msg.Values)
+					// ack so we don’t loop forever
+					q.client.XAck(ctx, topic, q.group, msg.ID)
+					continue
+				}
+
+				var evt wsmodels.Event
+				if err := json.Unmarshal([]byte(raw), &evt); err != nil {
+					slog.Error("Subscribe: unmarshal", "err", err)
+					// ack so broken messages don’t block
+					q.client.XAck(ctx, topic, q.group, msg.ID)
+					continue
+				}
+
+				out <- evt
+				// ACK immediately after sending into the channel:
+				if err := q.client.XAck(ctx, topic, q.group, msg.ID).Err(); err != nil {
+					slog.Error("Subscribe: XAck", "err", err)
+				}
+			}
+		}
+	}()
+	return out
 }
 
-func (q *RedisQueue[T]) ProduceEvent(ctx context.Context, topic string, e wsmodels.Event) {
-	data, err := e.MarshalBinary()
-	if err != nil {
-		slog.Error("failed to marshal event", "error", err)
-		return
-	}
-	if err := q.client.RPush(ctx, topic, data).Err(); err != nil {
-		slog.Error("failed to produce event", "error", err)
-	}
-}
-
-func (q *RedisQueue[T]) Close() {
+// Close the Redis client
+func (q *RedisStreamQueue[T]) Close() {
 	if err := q.client.Close(); err != nil {
-		slog.Error("failed to close redis client", "error", err)
+		slog.Error("Close: redis", "err", err)
 	}
 }
