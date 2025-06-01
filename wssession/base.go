@@ -5,9 +5,8 @@ import (
 	"fmt"
 	"github.com/Seann-Moser/multiws/wsmodels"
 	"github.com/Seann-Moser/multiws/wsqueue"
-	"github.com/eko/gocache/lib/v4/cache"
-	"github.com/eko/gocache/lib/v4/store"
 	"github.com/gorilla/websocket"
+	"github.com/redis/go-redis/v9"
 	"log/slog"
 	"net/http"
 	"sync"
@@ -17,7 +16,7 @@ import (
 var _ Session = &BaseSession{}
 
 type BaseSession struct {
-	sessionCache   *cache.Cache[wsmodels.Session]
+	sessionCache   redis.Cmdable
 	queue          wsqueue.Queue[wsmodels.Event]
 	currentSession *wsmodels.Session
 
@@ -38,21 +37,45 @@ var upgrader = websocket.Upgrader{
 }
 
 func NewBaseSession(
-	sessionCache *cache.Cache[wsmodels.Session],
+	r redis.Cmdable,
 	queue wsqueue.Queue[wsmodels.Event]) Session {
 	return &BaseSession{
-		sessionCache: sessionCache,
+		sessionCache: r,
 		queue:        queue,
 		wsOutbound:   make(chan wsmodels.Event, 100),
 	}
 }
 
 func (s *BaseSession) ID() string {
+	if s.currentSession == nil {
+		return ""
+	}
 	return s.currentSession.ID
 }
 
 func (s *BaseSession) Status() string {
 	return ""
+}
+
+func (s *BaseSession) getSession(ctx context.Context, key string) (*wsmodels.Session, error) {
+	results := s.sessionCache.Get(ctx, key)
+	if results.Err() != nil {
+		return nil, results.Err()
+	}
+	var session wsmodels.Session
+	err := results.Scan(&session)
+	if err != nil {
+		return nil, err
+	}
+	return &session, nil
+}
+
+func (s *BaseSession) setSession(ctx context.Context, key string, session *wsmodels.Session) error {
+	results := s.sessionCache.Set(ctx, key, session, 6*time.Hour)
+	if results.Err() != nil {
+		return results.Err()
+	}
+	return nil
 }
 
 func (s *BaseSession) Init(ctx context.Context, sessionID string, user *wsmodels.User) error {
@@ -61,10 +84,16 @@ func (s *BaseSession) Init(ctx context.Context, sessionID string, user *wsmodels
 	}
 	s.lastEventSent = time.Now()
 	key := sessionID + "_session_info"
-	ses, err := s.sessionCache.Get(ctx, key)
+	///2025/06/01 13:32:36 INFO session found in cache session=""
+	ses, err := s.getSession(ctx, key)
 	if err == nil {
-		s.currentSession = &ses
-		slog.Info("session found in cache")
+
+		s.currentSession = ses
+		if s.ID() == "" {
+			slog.Error("session id is missing", "session", ses)
+			return fmt.Errorf("session not found")
+		}
+		slog.Info("session found in cache", "session", s.ID())
 		if user != nil {
 			user.Host = len(s.currentSession.Users) == 0
 			user.Joined = time.Now().Unix()
@@ -75,7 +104,6 @@ func (s *BaseSession) Init(ctx context.Context, sessionID string, user *wsmodels
 			}
 			s.currentSession.Self = *user
 		}
-
 		s.produceChan = s.queue.Produce(ctx, "ses_"+s.ID())
 		s.consumeChan = s.queue.Subscribe(ctx, "ses_"+s.ID())
 
@@ -86,6 +114,7 @@ func (s *BaseSession) Init(ctx context.Context, sessionID string, user *wsmodels
 		if err != nil {
 			return err
 		}
+		slog.Info("session joined", "user", e)
 		s.SendEvent(ctx, e)
 		return nil
 	}
@@ -109,8 +138,9 @@ func (s *BaseSession) Init(ctx context.Context, sessionID string, user *wsmodels
 		}
 		session.Self = *user
 	}
+	slog.Info("session", "session", session)
 
-	err = s.sessionCache.Set(ctx, key, session, store.WithExpiration(6*time.Hour))
+	err = s.setSession(ctx, key, &session)
 	if err != nil {
 		slog.Error("failed to set session info", "err", err)
 		return err
@@ -279,7 +309,7 @@ func (s *BaseSession) WsHandler(h WsHandler) http.HandlerFunc {
 					if s.currentSession == nil {
 						return
 					}
-					if time.Since(s.lastEventSent) > s.currentSession.IdleDuration && s.currentSession.Self.Status == wsmodels.StatusConnected {
+					if time.Since(s.lastEventSent) > time.Minute && s.currentSession.Self.Status == wsmodels.StatusConnected {
 						s.currentSession.Self.Status = wsmodels.StatusIdle
 						slog.Info("user idle for too long", "user", s.currentSession.Self.Name, "time", time.Since(s.lastEventSent))
 						e := wsmodels.Event{
@@ -334,7 +364,8 @@ func (s *BaseSession) WsHandler(h WsHandler) http.HandlerFunc {
 				if err != nil {
 					slog.Error("failed to read JSON message:", "err", err, "")
 					s.Disconnect()
-					continue
+					_ = conn.Close()
+					return
 				}
 				if s.processEvent(event) {
 					continue
@@ -389,7 +420,7 @@ func (s *BaseSession) processEvent(e wsmodels.Event) bool {
 			return false
 		}
 		key := s.ID() + "_session_info"
-		err = s.sessionCache.Set(context.Background(), key, *s.currentSession, store.WithExpiration(6*time.Hour))
+		err = s.setSession(context.Background(), key, s.currentSession)
 		if err != nil {
 			slog.Error("failed to set session info", "err", err)
 		}
@@ -410,7 +441,7 @@ func (s *BaseSession) processEvent(e wsmodels.Event) bool {
 			return false
 		}
 		key := s.ID() + "_session_info"
-		err := s.sessionCache.Set(context.Background(), key, *s.currentSession, store.WithExpiration(6*time.Hour))
+		err := s.setSession(context.Background(), key, s.currentSession)
 		if err != nil {
 			slog.Error("failed to set session info", "err", err)
 		}

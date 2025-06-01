@@ -3,6 +3,7 @@ package wsmodels
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 )
 
 const (
@@ -32,6 +33,7 @@ func (e *Event) Set(data interface{}) (err error) {
 
 func GetDataEvent[T any](e Event) (out *T, err error) {
 	var t T
+	slog.Info("GetDataEvent[", "data", e)
 	if e.Data == "" {
 		return nil, fmt.Errorf("event data is empty")
 	}
