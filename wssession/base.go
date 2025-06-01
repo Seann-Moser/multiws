@@ -309,7 +309,7 @@ func (s *BaseSession) WsHandler(h WsHandler) http.HandlerFunc {
 					if s.currentSession == nil {
 						return
 					}
-					if time.Since(s.lastEventSent) > time.Minute && s.currentSession.Self.Status == wsmodels.StatusConnected {
+					if time.Since(s.lastEventSent) > s.currentSession.IdleDuration && s.currentSession.Self.Status == wsmodels.StatusConnected {
 						s.currentSession.Self.Status = wsmodels.StatusIdle
 						slog.Info("user idle for too long", "user", s.currentSession.Self.Name, "time", time.Since(s.lastEventSent))
 						e := wsmodels.Event{
